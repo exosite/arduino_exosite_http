@@ -1,0 +1,36 @@
+#######################################
+# Syntax Coloring Map For ExositeHTTP
+#######################################
+
+#######################################
+# Classes and Datatypes (KEYWORD1)
+#######################################
+
+ExositeHTTP     KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+
+setToken        KEYWORD2
+setTimeout      KEYWORD2
+provision       KEYWORD2
+write           KEYWORD2
+read            KEYWORD2
+longPoll        KEYWORD2
+timestamp       KEYWORD2
+
+#######################################
+# Structures (KEYWORD3)
+#######################################
+
+#######################################
+# Constants and Macros (LITERAL1)
+#######################################
+
+EXO_DEBUG_LOGGING      LITERAL1
+NO_FLASH_NET_STRINGS   LITERAL1
+EXO_DATA_BUFFER_SIZE   LITERAL1
+ACTIVATOR_VERSION      LITERAL1
+LOG_DEBUG              LITERAL1
+G                      LITERAL1
