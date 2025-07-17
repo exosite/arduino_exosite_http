@@ -6,19 +6,20 @@
 # Classes and Datatypes (KEYWORD1)
 #######################################
 
-ExositeHTTP     KEYWORD1
+ExositeHTTP            KEYWORD1
+ApiResponse            KEYWORD1
 
 #######################################
 # Methods and Functions (KEYWORD2)
 #######################################
 
-setToken        KEYWORD2
-setTimeout      KEYWORD2
-provision       KEYWORD2
-write           KEYWORD2
-read            KEYWORD2
-longPoll        KEYWORD2
-timestamp       KEYWORD2
+setToken               KEYWORD2
+setTimeout             KEYWORD2
+provision              KEYWORD2
+write                  KEYWORD2
+read                   KEYWORD2
+longPoll               KEYWORD2
+timestamp              KEYWORD2
 
 #######################################
 # Structures (KEYWORD3)

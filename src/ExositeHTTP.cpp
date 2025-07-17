@@ -68,6 +68,18 @@ void ExositeHTTP::setTimeout(const unsigned long rxTimeoutMs) {
   _rxTimeout = rxTimeoutMs;
 }
 
+void ExositeHTTP::flushClient() {
+  unsigned long start = millis();
+
+  while ((millis() - start) < _flushTimeout) {
+    while (_client->available()) {
+      _client->read();
+      start = millis(); // Reset timeout as more data is available
+    }
+    delay(_flushDelay); // Small wait for more data to potentially arrive
+  }
+}
+
 bool ExositeHTTP::isConnected() {
   if (!_client->connected()) {
     LOG_DEBUG(G("Opening client connection..."));
@@ -82,64 +94,56 @@ bool ExositeHTTP::timeExpired(unsigned long start, unsigned long duration) {
   return (millis() - start) >= duration;
 }
 
-bool ExositeHTTP::readHttpResponse(char* buffer, size_t maxLen, unsigned long timeoutMs) {
-  LOG_DEBUG(G("Parsing HTTP response..."));
+bool ExositeHTTP::readHttpResponse(char* buffer, size_t bufferSize, unsigned long timeoutMs) {
+  unsigned long startTime = millis();
+
+  const size_t maxSize = bufferSize - 1;
 
   char c;
   size_t pos = 0;
   bool dataReceived = false;
-
-  unsigned long startTime = millis();
+  bool fullyParsed = false;
 
   const unsigned int waitMs = 10;
   const unsigned int maxWaitCycles = 10;
   unsigned int waitCycles = 0;
 
-  while (pos < (maxLen - 1)) {
-    // Check against specified timeout
+  while (true) {
+    // Timeout check
     if (timeExpired(startTime, timeoutMs)) {
-      Serial.println(G("[Error] Timed out processing HTTP response"));
-
-      // Flush remaining data
-      while (_client->available()) c = _client->read();
-      return false;
+      LOG_ERROR(G("Timed out processing HTTP response"));
+      flushClient(); // Flush any remaining data
+      break;
     }
-    // Read data, once (and while) available
+    // Read data as it becomes available
     else if (_client->available()) {
-      dataReceived = true;
-      c = _client->read();
-      buffer[pos++] = c; // Assigns c into buffer[pos], then increments pos
+      // Size check
+      if (pos < maxSize) {
+        dataReceived = true;
+        c = _client->read();
+        buffer[pos++] = c;
+      }
+      else {
+        LOG_ERROR(G("Request response is larger than internal buffer allocation (≥"), bufferSize, G(" B)"));
+        flushClient(); // Flush any remaining data
+        break;
+      }
     }
     else if (dataReceived && waitCycles++ < maxWaitCycles) {
-      delay(waitMs); // Small pause to wait for more data
+      delay(waitMs); // Small pause in case of a delay in the response data
     }
     else if (dataReceived) {
-      buffer[pos] = '\0';
+      fullyParsed = true;
       break;
     }
   }
 
-  buffer[pos++] = '\0'; // For asolute certainty that the buffer is safely terminated
+  buffer[pos] = '\0'; // Always null terminate
 
-  // Validate content size
-  if (pos >= maxLen) {
-    Serial.print(G("[Error] Response content too large for internal buffer (>= "));
-    Serial.print(maxLen);
-    Serial.println(G(" bytes)"));
-
-    // Flush remaining data
-    while (_client->available()) c = _client->read();
-
-    return false;
-  }
-
-  return dataReceived;
+  return fullyParsed;
 }
 
 void ExositeHTTP::sendGetRequest(const char* path, const char* resource, const char* clientAuth, const char* pollHeaders) {
-  LOG_DEBUG(G("Sending GET"));
-  LOG_DEBUG(path);
-
   _client->print(G("GET "));
   _client->print(path);
   if (resource) {
@@ -172,8 +176,6 @@ void ExositeHTTP::sendGetRequest(const char* path, const char* resource, const c
 }
 
 void ExositeHTTP::sendPostRequest(const char* path, const char* key, const char* value, const char* clientAuth) {
-  LOG_DEBUG(G("Sending POST"));
-
   _client->print(G("POST "));
   _client->print(path);
   _client->println(G(" HTTP/1.1"));
@@ -213,284 +215,326 @@ void ExositeHTTP::buildPollHeaders(char* buffer, size_t bufferSize, unsigned lon
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-bool ExositeHTTP::provision(const char* identity, char* responseBuffer, size_t bufferSize) {
+ApiResponse ExositeHTTP::provision(const char* identity, char* responseBuffer, size_t bufferSize) {
+  ApiResponse res;
+  res.statusCode = 0;
+  res.success = false;
+
   responseBuffer[0] = '\0'; // Ensure the provided response buffer is cleared for use
 
   if (!isConnected()) {
-    Serial.println(G("[Error] Could not connect to server"));
-    return false;
+    LOG_ERROR(G("Failed to connect to server"));
+    return res;
   }
 
   if (!identity || !responseBuffer || bufferSize < 41) {
-    Serial.println(G("[Error] Invalid arguments for provisioning"));
-    return false;
+    LOG_ERROR(G("Invalid arguments for provisioning"));
+    return res;
   }
 
-  _client->flush();
   sendPostRequest("/provision/activate", "id", identity, nullptr);
 
   // Use the shared buffer to receive the HTTP response
   if (!readHttpResponse(_dataBuffer, sizeof(_dataBuffer), _rxTimeout)) {
-    Serial.println(G("[Error] Failed to read HTTP response"));
-    return false;
+    LOG_ERROR(G("Failed to fully parse HTTP response"));
+    LOG_DEBUG(G("Raw response:\n"), _dataBuffer);
+    return res;
   }
 
   // Extract HTTP status code
   int statusCode = 0;
   if (sscanf(_dataBuffer, "HTTP/1.1 %d", &statusCode) != 1) {
-    Serial.println(G("[Error] Could not parse HTTP status code"));
-    LOG_DEBUG(_dataBuffer);
-    return false;
+    LOG_ERROR(G("Could not parse HTTP status code"));
+    LOG_DEBUG(G("Raw response:\n"), _dataBuffer);
+    return res;
   }
 
+  res.statusCode = statusCode;
+
+  // Handle by HTTP status code
   if (statusCode == 200) {
     const char* body = strstr(_dataBuffer, "\r\n\r\n"); // Assume body starts after double CRLF
     if (!body) {
-      Serial.println(G("[Error] Malformed HTTP response"));
-      return false;
+      LOG_ERROR(G("Malformed HTTP response"));
+      LOG_DEBUG(G("Raw response:\n"), _dataBuffer);
+      return res;
     }
-
-    body += 4; // Skip past double CRLF ("\r\n\r\n")
-
-    urlDecode(body, responseBuffer);
-
-    return true;
+    else {
+      body += 4; // Skip past double CRLF ("\r\n\r\n")
+      res.success = urlDecode(body, responseBuffer, bufferSize);
+      return res;
+    }
   }
-
-  if (statusCode == 409) {
-    Serial.println(G("[Error] Identity is already provisioned (409 Conflict)"));
-    return false;
+  else if (statusCode == 409) {
+    LOG_ERROR(G("Identity is already provisioned (409 Conflict)"));
+    return res;
   }
-
-  Serial.print(G("[Error] Unexpected HTTP status: "));
-  Serial.println(statusCode);
-  return false;
+  else {
+    LOG_ERROR(G("Unexpected HTTP status: "), statusCode);
+    return res;
+  }
 }
 
-bool ExositeHTTP::provision(const String& identity, String& responseString) {
+ApiResponse ExositeHTTP::provision(const String& identity, String& responseString) {
+  ApiResponse res;
+  res.statusCode = 0;
+  res.success = false;
+
   responseString = ""; // Ensure the provided response String is cleared for use
 
   if (!isConnected()) {
-    Serial.println(G("[Error] Could not connect to server"));
-    return false;
+    LOG_ERROR(G("Failed to connect to server"));
+    return res;
   }
 
   if (identity.length() == 0) {
-    Serial.println(G("[Error] Empty identity string"));
-    return false;
+    LOG_ERROR(G("Cannot provision provided identity: "), identity);
+    return res;
   }
 
-  _client->flush();
   sendPostRequest("/provision/activate", "id", identity.c_str(), nullptr);
 
   // Use the shared buffer to receive the HTTP response
   if (!readHttpResponse(_dataBuffer, sizeof(_dataBuffer), _rxTimeout)) {
-    Serial.println(G("[Error] Failed to read HTTP response"));
-    return false;
+    LOG_ERROR(G("Failed to fully parse HTTP response"));
+    LOG_DEBUG(G("Raw response:\n"), _dataBuffer);
+    return res;
   }
 
   // Extract HTTP status code
   int statusCode = 0;
   if (sscanf(_dataBuffer, "HTTP/1.1 %d", &statusCode) != 1) {
-    Serial.println(G("[Error] Could not parse HTTP status code"));
-    LOG_DEBUG(_dataBuffer);
-    return false;
+    LOG_ERROR(G("Could not parse HTTP status code"));
+    LOG_DEBUG(G("Raw response:\n"), _dataBuffer);
+    return res;
   }
 
+  res.statusCode = statusCode;
+
+  // Handle by HTTP status code
   if (statusCode == 200) {
     const char* body = strstr(_dataBuffer, "\r\n\r\n"); // Assume body starts after double CRLF
     if (!body) {
-      Serial.println(G("[Error] Malformed HTTP response"));
-      return false;
+      LOG_ERROR(G("Malformed HTTP response"));
+      LOG_DEBUG(G("Raw response:\n"), _dataBuffer);
+      return res;
     }
-
-    body += 4; // Skip past double CRLF ("\r\n\r\n")
-
-    responseString = String(body);
-
-    if (responseString.length() < 40) {
-      Serial.println(G("[Error] Response body too short"));
-      return false;
+    else {
+      body += 4; // Skip past double CRLF ("\r\n\r\n")
+      res.success = urlDecode(String(body), responseString);
+      return res;
     }
-
-    return true;
   }
-
-  Serial.print(G("[Error] Unexpected HTTP status: "));
-  Serial.println(statusCode);
-  return false;
+  else if (statusCode == 409) {
+    LOG_ERROR(G("Identity is already provisioned (409 Conflict)"));
+    return res;
+  }
+  else {
+    LOG_ERROR(G("Unexpected HTTP status: "), statusCode);
+    LOG_DEBUG(G("Raw response:\n"), _dataBuffer);
+    return res;
+  }
 }
 
-bool ExositeHTTP::write(const char* resource, const char* writeChars) {
+ApiResponse ExositeHTTP::write(const char* resource, const char* writeChars) {
+  ApiResponse res;
+  res.statusCode = 0;
+  res.success = false;
+
   if (!isConnected()) {
-    Serial.println(G("[Error] Could not connect to server"));
-    return false;
+    LOG_ERROR(G("Failed to connect to server"));
+    return res;
   }
 
   if (!resource || !writeChars) {
-    Serial.println(G("[Error] Missing value for resource and/or writeString"));
-    return false;
+    LOG_ERROR(G("Missing value for resource and/or writeChars"));
+    return res;
   }
 
   // Use the shared buffer to hold encoded request payload
-  urlEncode(writeChars, _dataBuffer, sizeof(_dataBuffer));
+  if (urlEncode(writeChars, _dataBuffer, sizeof(_dataBuffer))) {
+    sendPostRequest("/onep:v1/stack/alias", resource, _dataBuffer, _clientToken);
 
-  _client->flush();
-  sendPostRequest("/onep:v1/stack/alias", resource, _dataBuffer, _clientToken);
+    // [Re]use the shared buffer to receive the HTTP response
+    if (!readHttpResponse(_dataBuffer, sizeof(_dataBuffer), _rxTimeout)) {
+      LOG_ERROR(G("Failed to fully parse HTTP response"));
+      LOG_DEBUG(G("Raw response:\n"), _dataBuffer);
+      return res;
+    }
 
-  // [Re]use the shared buffer to receive the HTTP response
-  if (!readHttpResponse(_dataBuffer, sizeof(_dataBuffer), _rxTimeout)) {
-    Serial.println(G("[Error] Failed to read HTTP response"));
-    return false;
+    // Extract HTTP status code
+    int statusCode = 0;
+    if (sscanf(_dataBuffer, "HTTP/1.1 %d", &statusCode) != 1) {
+      LOG_ERROR(G("Could not parse HTTP status code"));
+      LOG_DEBUG(G("Raw response:\n"), _dataBuffer);
+      return res;
+    }
+
+    res.statusCode = statusCode;
+
+    // Handle by HTTP status code
+    if (statusCode == 204) {
+      res.success = true;
+      return res;
+    }
+    else {
+      LOG_ERROR(G("Unexpected HTTP status: "), statusCode);
+      return res;
+    }
   }
-
-  // Extract HTTP status code
-  int statusCode = 0;
-  if (sscanf(_dataBuffer, "HTTP/1.1 %d", &statusCode) != 1) {
-    Serial.println(G("[Error] Could not parse HTTP status code"));
-    LOG_DEBUG(_dataBuffer);
-    return false;
+  else {
+    return res; // Failed to encode provided writeChars
   }
-
-  if (statusCode == 204) {
-    return true;
-  }
-
-  Serial.print(G("[Error] Unexpected HTTP status: "));
-  Serial.println(statusCode);
-  return false;
 }
 
-bool ExositeHTTP::write(const String& resource, const String& writeString) {
+ApiResponse ExositeHTTP::write(const String& resource, const String& writeString) {
   return write(resource.c_str(), writeString.c_str());
 }
 
-bool ExositeHTTP::read(const char* resource, char* responseBuffer, size_t bufferSize) {
+ApiResponse ExositeHTTP::read(const char* resource, char* responseBuffer, size_t bufferSize) {
+  ApiResponse res;
+  res.statusCode = 0;
+  res.success = false;
+
   responseBuffer[0] = '\0'; // Ensure the provided response buffer is cleared for use
 
   if (!isConnected()) {
-    Serial.println(G("[Error] Could not connect to server"));
-    return false;
+    LOG_ERROR(G("Failed to connect to server"));
+    return res;
   }
 
-  _client->flush();
   sendGetRequest("/onep:v1/stack/alias", resource, _clientToken, nullptr);
 
   // Use the shared buffer to receive the HTTP response
   if (!readHttpResponse(_dataBuffer, sizeof(_dataBuffer), _rxTimeout)) {
-    Serial.println(G("[Error] Failed to read HTTP response"));
-    return false;
+    LOG_ERROR(G("Failed to fully parse HTTP response"));
+    LOG_DEBUG(G("Raw response:\n"), _dataBuffer);
+    return res;
   }
 
   // Extract HTTP status code
   int statusCode = 0;
   if (sscanf(_dataBuffer, "HTTP/1.1 %d", &statusCode) != 1) {
-    Serial.println(G("[Error] Could not parse HTTP status code"));
-    LOG_DEBUG(_dataBuffer);
-    return false;
+    LOG_ERROR(G("Could not parse HTTP status code"));
+    LOG_DEBUG(G("Raw response:\n"), _dataBuffer);
+    return res;
   }
 
+  res.statusCode = statusCode;
+
+  // Handle by HTTP status code
   if (statusCode == 200) {
     char* body = strstr(_dataBuffer, "\r\n\r\n"); // Assume body starts after double CRLF
     if (!body) {
-      Serial.println(G("[Error] Malformed HTTP response"));
-      return false;
+      LOG_ERROR(G("Malformed HTTP response"));
+      LOG_DEBUG(G("Raw response:\n"), _dataBuffer);
+      return res;
     }
+    else {
+      body += 4; // Skip past double CRLF ("\r\n\r\n")
 
-    body += 4; // Skip past double CRLF ("\r\n\r\n")
+      // Confirm the response body matches the expected structure
+      const char* delimiter = strchr(body, '=');
+      if (!delimiter || *(delimiter + 1) == '\0') {
+        LOG_ERROR(G("Malformed response body (not 'resource=value')"));
+        LOG_DEBUG(G("Raw response:\n"), _dataBuffer);
+        return res;
+      }
 
-    // Confirm the response body matches the expected structure
-    const char* delimiter = strchr(body, '=');
-    if (!delimiter || *(delimiter + 1) == '\0') {
-      Serial.println(G("[Error] Malformed response body (not 'resource=value')"));
-      return false;
+      const char* value = delimiter + 1; // Skip past the delimiter, to just the value
+
+      res.success = urlDecode(value, responseBuffer, bufferSize);
+      return res;
     }
-
-    const char* value = delimiter + 1; // Skip past the delimiter, to just the value
-    if (strlen(value) >= (bufferSize - 1)) {
-      Serial.print(G("[Error] Response body too large for provided buffer: "));
-      Serial.println(strlen(value));
-      return false;
-    }
-
-    urlDecode(value, responseBuffer);
-
-    return true;
   }
   else if (statusCode == 204) {
-    return true;
+    res.success = true;
+    return res;
   }
 
-  Serial.print(G("[Error] Unexpected HTTP status: "));
-  Serial.println(statusCode);
-  return false;
+  LOG_ERROR(G("Unexpected HTTP status: "), statusCode);
+  return res;
 }
 
-bool ExositeHTTP::read(const String& resource, String& responseString) {
+ApiResponse ExositeHTTP::read(const String& resource, String& responseString) {
+  ApiResponse res;
+  res.statusCode = 0;
+  res.success = false;
+
   responseString = ""; // Ensure the provided response String is cleared for use
 
   if (!isConnected()) {
-    Serial.println(G("[Error] Could not connect to server"));
-    return false;
+    LOG_ERROR(G("Failed to connect to server"));
+    return res;
   }
 
-  _client->flush();
   sendGetRequest("/onep:v1/stack/alias", resource.c_str(), _clientToken, nullptr);
 
   // Use the shared buffer to receive the HTTP response
   if (!readHttpResponse(_dataBuffer, sizeof(_dataBuffer), _rxTimeout)) {
-    Serial.println(G("[Error] Failed to read HTTP response"));
-    return false;
+    LOG_ERROR(G("Failed to fully parse HTTP response"));
+    LOG_DEBUG(G("Raw response:\n"), _dataBuffer);
+    return res;
   }
 
   // Extract HTTP status code
   int statusCode = 0;
   if (sscanf(_dataBuffer, "HTTP/1.1 %d", &statusCode) != 1) {
-    Serial.println(G("[Error] Could not parse HTTP status code"));
-    LOG_DEBUG(_dataBuffer);
-    return false;
+    LOG_ERROR(G("Could not parse HTTP status code"));
+    LOG_DEBUG(G("Raw response:\n"), _dataBuffer);
+    return res;
   }
 
+  res.statusCode = statusCode;
+
+  // Handle by HTTP status code
   if (statusCode == 200) {
     char* body = strstr(_dataBuffer, "\r\n\r\n"); // Assume body starts after double CRLF
     if (!body) {
-      Serial.println(G("[Error] Malformed HTTP response"));
-      return false;
+      LOG_ERROR(G("Malformed HTTP response"));
+      LOG_DEBUG(G("Raw response:\n"), _dataBuffer);
+      return res;
     }
+    else {
+      body += 4; // Skip past double CRLF ("\r\n\r\n")
 
-    body += 4; // Skip past double CRLF ("\r\n\r\n")
+      // Confirm the response body matches the expected structure
+      const char* delimiter = strchr(body, '=');
+      if (!delimiter || *(delimiter + 1) == '\0') {
+        LOG_ERROR(G("Malformed response body (not 'resource=value')"));
+        LOG_DEBUG(G("Raw response:\n"), _dataBuffer);
+        return res;
+      }
 
-    // Confirm the response body matches the expected structure
-    const char* delimiter = strchr(body, '=');
-    if (!delimiter || *(delimiter + 1) == '\0') {
-      Serial.println(G("[Error] Malformed response body (not 'resource=value')"));
-      return false;
+      const char* value = delimiter + 1; // Skip past the delimiter, to just the value
+      res.success = urlDecode(value, responseString);
+      return res;
     }
-
-    const char* value = delimiter + 1; // Skip past the delimiter, to just the value
-    urlDecode(value, responseString);
-
-    return true;
   }
   else if (statusCode == 204) {
-    return true;
+    res.success = true;
+    return res;
   }
-
-  Serial.print(G("[Error] Unexpected HTTP status: "));
-  Serial.println(statusCode);
-  return false;
+  else {
+    LOG_ERROR(G("Unexpected HTTP status: "), statusCode);
+    return res;
+  }
 }
 
-bool ExositeHTTP::longPoll(const char* resource, char* responseBuffer, size_t bufferSize, unsigned long lastModified, unsigned long pollTimeout) {
+ApiResponse ExositeHTTP::longPoll(const char* resource, char* responseBuffer, size_t bufferSize, unsigned long lastModified, unsigned long pollTimeout) {
+  ApiResponse res;
+  res.statusCode = 0;
+  res.success = false;
+
   responseBuffer[0] = '\0'; // Ensure the provided response buffer is cleared for use
+
   buildPollHeaders(_pollHeaders, sizeof(_pollHeaders), lastModified, pollTimeout);
 
   if (!isConnected()) {
-    Serial.println(G("[Error] Could not connect to server"));
-    return false;
+    LOG_ERROR(G("Failed to connect to server"));
+    return res;
   }
 
-  _client->flush();
   sendGetRequest("/onep:v1/stack/alias", resource, _clientToken, _pollHeaders);
 
   // For longPoll() only, adjust the receive timeout to ensure complete processing of the request
@@ -498,64 +542,68 @@ bool ExositeHTTP::longPoll(const char* resource, char* responseBuffer, size_t bu
 
   // Use the shared buffer to receive the HTTP response
   if (!readHttpResponse(_dataBuffer, sizeof(_dataBuffer), effectiveTimeout)) {
-    Serial.println(G("[Error] Failed to read HTTP response"));
-    return false;
+    LOG_ERROR(G("Failed to fully parse HTTP response"));
+    LOG_DEBUG(G("Raw response:\n"), _dataBuffer);
+    return res;
   }
 
   // Extract HTTP status code
   int statusCode = 0;
   if (sscanf(_dataBuffer, "HTTP/1.1 %d", &statusCode) != 1) {
-    Serial.println(G("[Error] Could not parse HTTP status code"));
-    LOG_DEBUG(_dataBuffer);
-    return false;
+    LOG_ERROR(G("Could not parse HTTP status code"));
+    LOG_DEBUG(G("Raw response:\n"), _dataBuffer);
+    return res;
   }
 
+  res.statusCode = statusCode;
+
+  // Handle by HTTP status code
   if (statusCode == 304) {
-    return true;
+    res.success = true;
+    return res;
   }
   else if (statusCode == 200) {
     char* body = strstr(_dataBuffer, "\r\n\r\n"); // Assume body starts after double CRLF
     if (!body) {
-      Serial.println(G("[Error] Malformed HTTP response"));
-      return false;
+      LOG_ERROR(G("Malformed response body"));
+      return res;
     }
+    else {
+      body += 4; // Skip past double CRLF ("\r\n\r\n")
 
-    body += 4; // Skip past double CRLF ("\r\n\r\n")
+      // Confirm the response body matches the expected structure
+      const char* delimiter = strchr(body, '=');
+      if (!delimiter || *(delimiter + 1) == '\0') {
+        LOG_ERROR(G("Malformed response body (not 'resource=value')"));
+        return res;
+      }
 
-    // Confirm the response body matches the expected structure
-    const char* delimiter = strchr(body, '=');
-    if (!delimiter || *(delimiter + 1) == '\0') {
-      Serial.println(G("[Error] Malformed response body (not 'resource=value')"));
-      return false;
+      const char* value = delimiter + 1; // Skip past the delimiter, to just the value
+
+      res.success = urlDecode(value, responseBuffer, bufferSize);
+      return res;
     }
-
-    const char* value = delimiter + 1; // Skip past the delimiter, to just the value
-    if (strlen(value) >= (bufferSize - 1)) {
-      Serial.print(G("[Error] Response body too large for provided buffer: "));
-      Serial.println(strlen(value));
-      return false;
-    }
-
-    urlDecode(value, responseBuffer);
-
-    return true;
   }
-
-  Serial.print(G("[Error] Unexpected HTTP status: "));
-  Serial.println(statusCode);
-  return false;
+  else {
+    LOG_ERROR(G("Unexpected HTTP status: "), statusCode);
+    return res;
+  }
 }
 
-bool ExositeHTTP::longPoll(const String& resource, String& responseString, unsigned long lastModified, unsigned long pollTimeout) {
+ApiResponse ExositeHTTP::longPoll(const String& resource, String& responseString, unsigned long lastModified, unsigned long pollTimeout) {
+  ApiResponse res;
+  res.statusCode = 0;
+  res.success = false;
+
   responseString = ""; // Ensure the provided response String is cleared for use
+
   buildPollHeaders(_pollHeaders, sizeof(_pollHeaders), lastModified, pollTimeout);
 
   if (!isConnected()) {
-    Serial.println(G("[Error] Could not connect to server"));
-    return false;
+    LOG_ERROR(G("Failed to connect to server"));
+    return res;
   }
 
-  _client->flush();
   sendGetRequest("/onep:v1/stack/alias", resource.c_str(), _clientToken, _pollHeaders);
 
   // For longPoll() only, adjust the receive timeout to ensure complete processing of the request
@@ -563,160 +611,219 @@ bool ExositeHTTP::longPoll(const String& resource, String& responseString, unsig
 
   // Use the shared buffer to receive the HTTP response
   if (!readHttpResponse(_dataBuffer, sizeof(_dataBuffer), effectiveTimeout)) {
-    Serial.println(G("[Error] Failed to read HTTP response"));
-    return false;
+    LOG_ERROR(G("Failed to fully parse HTTP response"));
+    LOG_DEBUG(G("Raw response:\n"), _dataBuffer);
+    return res;
   }
 
   // Extract HTTP status code
   int statusCode = 0;
   if (sscanf(_dataBuffer, "HTTP/1.1 %d", &statusCode) != 1) {
-    Serial.println(G("[Error] Could not parse HTTP status code"));
-    LOG_DEBUG(_dataBuffer);
-    return false;
+    LOG_ERROR(G("Could not parse HTTP status code"));
+    LOG_DEBUG(G("Raw response:\n"), _dataBuffer);
+    return res;
   }
 
+  res.statusCode = statusCode;
+
+  // Handle by HTTP status code
   if (statusCode == 304) {
-    return true;
+    res.success = true;
+    return res;
   }
   else if (statusCode == 200) {
     char* body = strstr(_dataBuffer, "\r\n\r\n"); // Assume body starts after double CRLF
     if (!body) {
-      Serial.println(G("[Error] Malformed HTTP response"));
-      return false;
+      LOG_ERROR(G("Malformed HTTP response"));
+      return res;
     }
+    else {
+      body += 4; // Skip past double CRLF ("\r\n\r\n")
 
-    body += 4; // Skip past double CRLF ("\r\n\r\n")
+      // Confirm the response body matches the expected structure
+      const char* delimiter = strchr(body, '=');
+      if (!delimiter || *(delimiter + 1) == '\0') {
+        LOG_ERROR(G("Malformed response body (not 'resource=value')"));
+        return res;
+      }
 
-    // Confirm the response body matches the expected structure
-    const char* delimiter = strchr(body, '=');
-    if (!delimiter || *(delimiter + 1) == '\0') {
-      Serial.println(G("[Error] Malformed response body (not 'resource=value')"));
-      return false;
+      const char* value = delimiter + 1; // Skip past the delimiter, to just the value
+
+      res.success = urlDecode(value, responseString);
+      return res;
     }
-
-    const char* value = delimiter + 1; // Skip past the delimiter, to just the value
-    urlDecode(value, responseString);
-
-    return true;
   }
-
-  Serial.print(G("[Error] Unexpected HTTP status: "));
-  Serial.println(statusCode);
-  LOG_DEBUG(_dataBuffer);
-  return false;
+  else {
+    LOG_ERROR(G("Unexpected HTTP status: "), statusCode);
+    return res;
+  }
 }
 
-unsigned long ExositeHTTP::timestamp() {
-  unsigned long timestamp = 0;
+ApiResponse ExositeHTTP::timestamp(unsigned long* serverTime) {
+  ApiResponse res;
+  res.statusCode = 0;
+  res.success = false;
 
   if (!isConnected()) {
-    Serial.println(G("[Error] Failed to open connection"));
-    return timestamp; // 0
+    LOG_ERROR(G("Failed to connect to server"));
+    return res;
   }
 
-  _client->flush();
   sendGetRequest("/timestamp", nullptr, nullptr, nullptr);
 
   // Use the shared buffer to receive the HTTP response
   if (!readHttpResponse(_dataBuffer, sizeof(_dataBuffer), _rxTimeout)) {
-    return timestamp; // 0
+    LOG_ERROR(G("Failed to fully parse HTTP response"));
+    LOG_DEBUG(G("Raw response:\n"), _dataBuffer);
+    return res;
   }
 
-  if (strstr(_dataBuffer, "HTTP/1.1 200 OK")) {
+  // Extract HTTP status code
+  int statusCode = 0;
+  if (sscanf(_dataBuffer, "HTTP/1.1 %d", &statusCode) != 1) {
+    LOG_ERROR(G("Could not parse HTTP status code"));
+    LOG_DEBUG(G("Raw response:\n"), _dataBuffer);
+    return res;
+  }
+
+  res.statusCode = statusCode;
+
+  if (statusCode == 200) {
     char* bodyPos = strstr(_dataBuffer, "\r\n\r\n");
     if (bodyPos) {
       bodyPos = bodyPos + 4;
-      timestamp = strtoul(bodyPos, nullptr, 10);
+      *serverTime = strtoul(bodyPos, nullptr, 10);
+      res.success = true;
     }
   }
   else {
-    Serial.println(G("[Error] Unexpected HTTP response"));
+    LOG_ERROR(G("Unexpected HTTP status: "), statusCode);
+    return res;
   }
 
-  return timestamp;
+  return res;
 }
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-void ExositeHTTP::urlEncode(const char* src, char* dest, size_t destSize) {
+bool ExositeHTTP::urlEncode(const char* src, char* dest, size_t destSize) {
   static const char hex[] = "0123456789ABCDEF";
+  const size_t maxSize = destSize - 1;
+
   size_t pos = 0;
+  bool fullyEncoded = true;
 
-  while (*src && pos < destSize - 1) {
-    char c = *src++;
-    if (('a' <= c && c <= 'z') || 
-        ('A' <= c && c <= 'Z') || 
-        ('0' <= c && c <= '9') || 
-        c == '-' || c == '_' || c == '.' || c == '~') {
-      dest[pos++] = c; // Unreserved characters are not encoded
-    }
-    else if (c == ' ') {
-      dest[pos++] = '+';
-    }
-    else {
-      if (pos + 3 >= destSize) break; // Ensure room for %HH
-      dest[pos++] = '%';
-      dest[pos++] = hex[(c >> 4) & 0x0F];
-      dest[pos++] = hex[c & 0x0F];
-    }
-  }
-
-  dest[pos] = '\0'; // Null-terminate the encoded string
-}
-
-void ExositeHTTP::urlEncode(const String& src, String& dest) {
-  dest = "";
-  char hex[] = "0123456789ABCDEF";
-
-  for (size_t i = 0; i < src.length(); i++) {
-    char c = src.charAt(i);
-    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
-      dest += c; // Unreserved characters are not encoded
-    }
-    else if (c == ' ') {
-      dest += '+';
-    }
-    else {
-      dest += '%';
-      dest += hex[(c >> 4) & 0x0F];
-      dest += hex[c & 0x0F];
-    }
-  }
-}
-
-void ExositeHTTP::urlDecode(const char* src, char* dest) {
   while (*src) {
-    if (*src == '%') {
-      // Convert the next two characters into a byte and append to dest
-      char high = src[1];
-      char low = src[2];
-
-      if (high >= '0' && high <= '9') high = high - '0';
-      else if (high >= 'A' && high <= 'F') high = high - 'A' + 10;
-      else if (high >= 'a' && high <= 'f') high = high - 'a' + 10;
-
-      if (low >= '0' && low <= '9') low = low - '0';
-      else if (low >= 'A' && low <= 'F') low = low - 'A' + 10;
-      else if (low >= 'a' && low <= 'f') low = low - 'a' + 10;
-
-      *dest = (high << 4) + low;
-      src += 3;
-    }
-    else if (*src == '+') {
-      *dest = ' '; // Plus sign is replaced by a space
-      src++;
+    if (pos < maxSize) { // Size check
+      char c = *src++;
+      if (('a' <= c && c <= 'z') || 
+          ('A' <= c && c <= 'Z') || 
+          ('0' <= c && c <= '9') || 
+          c == '-' || c == '_' || c == '.' || c == '~') {
+        dest[pos++] = c; // Unreserved characters are not encoded
+      }
+      else if (c == ' ') {
+        dest[pos++] = '+'; // Space is replaced by a plus sign
+      }
+      else {
+        // Ensure room for %HH
+        if (pos + 3 >= maxSize) {
+          LOG_ERROR(G("Encoded request body larger than internal buffer (≥"), destSize, G(" B)"));
+          fullyEncoded = false;
+          break;
+        }
+        else {
+          dest[pos++] = '%';
+          dest[pos++] = hex[(c >> 4) & 0x0F];
+          dest[pos++] = hex[c & 0x0F];
+        }
+      }
     }
     else {
-      *dest = *src; // Directly copy unreserved characters
-      src++;
+      LOG_ERROR(G("Encoded request body larger than internal buffer (≥"), destSize, G(" B)"));
+      fullyEncoded = false;
+      break;
     }
-    dest++; // Move the pointer forward
   }
 
-  *dest = '\0'; // Null-terminate the decoded string
+  dest[pos] = '\0'; // Null-terminate the encoded value
+
+  if (!fullyEncoded) {
+    LOG_DEBUG(G("Encoded: "), dest);
+    LOG_DEBUG(G("Remainder: "), src);
+  }
+
+  return fullyEncoded;
 }
 
-void ExositeHTTP::urlDecode(const String& input, String& responseString) {
+bool ExositeHTTP::urlDecode(const char* src, char* dest, size_t destSize) {
+  const size_t maxSize = destSize - 1;
+
+  size_t pos = 0;
+  bool fullyDecoded = true;
+
+  while (*src) {
+    if (pos < maxSize) { // Size check
+      if (*src == '%') {
+        if (src[1] && src[2]) {
+          char high = src[1];
+          char low = src[2];
+
+          if (high >= '0' && high <= '9') high = high - '0';
+          else if (high >= 'A' && high <= 'F') high = high - 'A' + 10;
+          else if (high >= 'a' && high <= 'f') high = high - 'a' + 10;
+          else {
+            LOG_ERROR(G("Invalid hex in response body"));
+            fullyDecoded = false;
+            break;
+          }
+
+          if (low >= '0' && low <= '9') low = low - '0';
+          else if (low >= 'A' && low <= 'F') low = low - 'A' + 10;
+          else if (low >= 'a' && low <= 'f') low = low - 'a' + 10;
+          else {
+            LOG_ERROR(G("Invalid hex in response body"));
+            fullyDecoded = false;
+            break;
+          }
+
+          dest[pos++] = (high << 4) + low;
+          src += 3;
+        }
+        else {
+          LOG_ERROR(G("Incomplete escape sequence in response body"));
+          fullyDecoded = false;
+          break;
+        }
+      }
+      else if (*src == '+') {
+        dest[pos++] = ' '; // Plus sign is replaced by a space
+        src++;
+      }
+      else {
+        dest[pos++] = *src++; // Directly copy unreserved character
+      }
+    }
+    else {
+      LOG_ERROR(G("Decoded response body larger than provided buffer (≥"), destSize, G(" B)"));
+      fullyDecoded = false;
+      break;
+    }
+  }
+
+  dest[pos] = '\0'; // Null-terminate the decoded value
+
+  if (!fullyDecoded) {
+    LOG_DEBUG(G("Decoded: "), dest);
+    LOG_DEBUG(G("Remainder: "), src);
+  }
+
+  return fullyDecoded;
+}
+
+bool ExositeHTTP::urlDecode(const String& input, String& responseString) {
+  bool fullyDecoded = true;
+
   for (size_t i = 0; i < input.length(); i++) {
     char c = input.charAt(i);
     if (c == '%') {
@@ -728,19 +835,41 @@ void ExositeHTTP::urlDecode(const String& input, String& responseString) {
         if (high >= '0' && high <= '9') high -= '0';
         else if (high >= 'A' && high <= 'F') high = high - 'A' + 10;
         else if (high >= 'a' && high <= 'f') high = high - 'a' + 10;
+        else {
+          LOG_ERROR(G("Invalid hex in response body"));
+          fullyDecoded = false;
+          break;
+        }
 
         if (low >= '0' && low <= '9') low -= '0';
         else if (low >= 'A' && low <= 'F') low = low - 'A' + 10;
         else if (low >= 'a' && low <= 'f') low = low - 'a' + 10;
+        else {
+          LOG_ERROR(G("Invalid hex in response body"));
+          fullyDecoded = false;
+          break;
+        }
 
         responseString += char((high << 4) + low);
+      }
+      else {
+        LOG_ERROR(G("Incomplete escape sequence in response body"));
+        fullyDecoded = false;
+        break;
       }
     }
     else if (c == '+') {
       responseString += ' '; // Plus sign is replaced by a space
     }
     else {
-      responseString += c; // Directly copy unreserved characters
+      responseString += c; // Directly copy unreserved character
     }
   }
+
+  if (!fullyDecoded) {
+    LOG_DEBUG(G("Decoded: "), input);
+    LOG_DEBUG(G("Remainder: "), responseString);
+  }
+
+  return fullyDecoded;
 }

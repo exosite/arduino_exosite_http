@@ -1,4 +1,3 @@
-
 #include <ArduinoBearSSL.h>
 #include <ArduinoECCX08.h>
 #include <Arduino_ConnectionHandler.h>
@@ -9,40 +8,10 @@
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-// Number of milliseconds to delay between loop iterations
-const int LOOP_DELAY = 10000;
-
-// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-
-EthernetConnectionHandler conMan;
-EthernetClient tcpClient;
-EthernetUDP NTPUdp;
-
-NTPClient timeClient(NTPUdp);
-BearSSLClient sslClient(tcpClient);
-
-// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-
-#include "QSPIFBlockDevice.h"
-#include "MBRBlockDevice.h"
-
-using namespace mbed;
-
-// Constants
-#define BLOCK_DEVICE_SIZE (1024 * 8)     // 8 KB partition
-#define PARTITION_TYPE 0x0B              // FAT32 (just a label)
-#define TOKEN_MAX_LEN  64                // Safety buffer (40 chars + margin)
-#define TOKEN_OFFSET    0                // Offset in flash to store the token
-
-// Pin configuration for QSPI on Opta
-QSPIFBlockDevice qspi(QSPI_SO0, QSPI_SO1, QSPI_SO2, QSPI_SO3, QSPI_SCK, QSPI_CS, QSPIF_POLARITY_MODE_1, 40000000);
-MBRBlockDevice flashPartition(&qspi, 1);
-
-// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-
 #include "opta_info.h"
 
-char macAddress[18] = {}; // 17 + 1 (for null terminator)
+String macAddress;
+// char macAddress[18] = {0}; // 17 + 1 (for null terminator)
 
 OptaBoardInfo* info;
 OptaBoardInfo* boardInfo();
@@ -64,21 +33,55 @@ const int NUM_RELAYS = 4;
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
+#include "QSPIFBlockDevice.h"
+#include "MBRBlockDevice.h"
+
+using namespace mbed;
+
+// Constants
+#define BLOCK_DEVICE_SIZE (1024 * 8)     // 8 KB partition
+#define PARTITION_TYPE 0x0B              // FAT32 (just a label)
+#define TOKEN_MAX_LEN  64                // Safety buffer (40 chars + margin)
+#define TOKEN_OFFSET    0                // Offset in flash to store the token
+
+// Pin configuration for QSPI on Opta
+QSPIFBlockDevice qspi(QSPI_SO0, QSPI_SO1, QSPI_SO2, QSPI_SO3, QSPI_SCK, QSPI_CS, QSPIF_POLARITY_MODE_1, 40000000);
+MBRBlockDevice flashPartition(&qspi, 1);
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+EthernetConnectionHandler conMan;
+EthernetClient tcpClient;
+EthernetUDP NTPUdp;
+
+NTPClient timeClient(NTPUdp);
+BearSSLClient sslClient(tcpClient);
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
 #include <ExositeHTTP.h>
 #include <ExositeTrustAnchors.h>
 #include "cloud_config.h"
-
-String responseString;
-String writeString;
-JSONVar writeJson;
 
 const String configResource = "config_io";
 const String dataResource = "data_in";
 const String controlResource = "data_out";
 
-char tokenBuffer[TOKEN_MAX_LEN] = {};
+String deviceToken;
+
+String responseString;
+
+JSONVar writeJson;
+String writeString;
+
+ApiResponse res;
 
 ExositeHTTP exosite(&sslClient, CONNECTOR_DOMAIN);
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+// Number of milliseconds to delay between loop iterations
+const int LOOP_DELAY = 10000;
 
 /*================================================================================================
  * setup
@@ -88,7 +91,7 @@ ExositeHTTP exosite(&sslClient, CONNECTOR_DOMAIN);
 void setup() {
   Serial.begin(115200);
 
-  // Wait for Serial Monitor, then just get going after 2.5s
+  // Wait for Serial Monitor
   unsigned long startMillis = millis();
   while (!Serial && (millis() - startMillis < 2500)) {
     delay(250);
@@ -96,9 +99,9 @@ void setup() {
 
   Serial.println(F("setup | Start"));
 
-  // Halt execution if HSM not present
+  // If Hardware Security Module (HSM) not present, halt execution
   if (!ECCX08.begin()) {
-    Serial.println(F("setup | No ECCX08 present!"));
+    Serial.println(F("setup | No ECCX08 present - troubleshoot and reboot!"));
     while (1) {};
   }
 
@@ -126,43 +129,51 @@ void setup() {
   // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
   //                             Cloud Provisioning
   // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-  // if (true) {
-  if (!loadToken(tokenBuffer, sizeof(tokenBuffer))) {
+
+  if (!loadToken(deviceToken)) {
     Serial.println(F("setup | No auth token found - provisioning..."));
 
-    if (exosite.provision(macAddress, tokenBuffer, sizeof(tokenBuffer))) {
-      Serial.print(F("setup | Provisioning succeeded: "));
-      Serial.println(tokenBuffer);
+    res = exosite.provision(macAddress, deviceToken);
+
+    if (res.success) {
+      Serial.print(F("setup | Provisioning successful: "));
+      Serial.println(deviceToken);
 
       // Store the token in the persistent QSPI Flash
-      storeToken(tokenBuffer);
+      storeToken(deviceToken);
 
       // Update the existing client with the newly retrieved auth
-      exosite.setToken(tokenBuffer);
+      exosite.setToken(deviceToken);
     }
     else {
-      Serial.println(F("setup | Provisioning failed!"));
+      Serial.print(F("setup | Provisioning failed ("));
+      Serial.print(res.statusCode);
+      Serial.println(F(")"));
     }
   }
   else {
     Serial.print(F("setup | Stored token found: "));
-    Serial.println(tokenBuffer);
+    Serial.println(deviceToken);
 
     // Update the existing client with the defined auth
-    exosite.setToken(tokenBuffer);
+    exosite.setToken(deviceToken);
   }
 
-  // Don't move on without valid client auth
-  while (tokenBuffer[0] == '\0') {
+  // If client auth has not been attained, halt execution
+  while (deviceToken.isEmpty()) {
     Serial.println(F("setup | No auth token found - troubleshoot and reboot!"));
     delay(60000);
   }
 
   Serial.println(F("setup | Reporting Channel Configuration..."));
 
-  // Channel Config is parsed and serialized for minification (whitespace removal)
-  if (!exosite.write(configResource, JSON.stringify(JSON.parse(CHANNEL_CONFIG)))) {
-    Serial.println(F("setup | Failed to report Channel Config!"));
+  // Note: Channel Config is parsed and [re]serialized for whitespace removal
+  res = exosite.write(configResource, JSON.stringify(JSON.parse(CHANNEL_CONFIG)));
+
+  if (!res.success) {
+    Serial.print(F("setup | Failed to report Channel Config ("));
+    Serial.print(res.statusCode);
+    Serial.println(F(")"));
   }
 
   delay(1000);
@@ -187,8 +198,12 @@ void loop() {
     Serial.print(F("loop | Writing data to the cloud: "));
     Serial.println(writeString);
 
-    if (!exosite.write(dataResource, writeString)) {
-      Serial.println(F("loop | Failed to write data to the cloud"));
+    res = exosite.write(dataResource, writeString);
+
+    if (!res.success) {
+      Serial.print(F("loop | Failed to write data to the cloud ("));
+      Serial.print(res.statusCode);
+      Serial.println(F(")"));
     }
   }
   else {
@@ -251,17 +266,26 @@ void handleResponse(const String& resource, String& response) {
 
 void handleConfigIo(String& value) {
   // Report the value back to the cloud to acknowledge receipt
-  if (!exosite.write(configResource, value)) {
-    Serial.println();
-    Serial.println(F("handleConfigIo | Failed to acknowledge config_io resource value!"));
+  res = exosite.write(configResource, value);
+
+  if (!res.success) {
+    Serial.print(F("handleConfigIo | Failed to acknowledge config_io resource value ("));
+    Serial.print(res.statusCode);
+    Serial.println(F(")"));
   }
+  // - - - - - - - - - - - - - - - - - - - - - -
+  // <custom handling>
+  // - - - - - - - - - - - - - - - - - - - - - -
 }
 
 void handleDataOut(String& value) {
   // Report the value back to the cloud to acknowledge receipt
-  if (!exosite.write(controlResource, value)) {
-    Serial.println();
-    Serial.println(F("handleDataOut | Failed to acknowledge data_out resource value!"));
+  res = exosite.write(controlResource, value);
+
+  if (!res.success) {
+    Serial.print(F("handleDataOut | Failed to acknowledge data_out resource value ("));
+    Serial.print(res.statusCode);
+    Serial.println(F(")"));
   }
   // - - - - - - - - - - - - - - - - - - - - - -
   // <custom handling>
@@ -310,7 +334,7 @@ void initOpta() {
   // Retrieve Opta board info
   info = boardInfo();
 
-  // Populate the macAddress char array
+  // Populate the macAddress String
   getEthernetMacAddress(info, macAddress);
 
   // Print Opta Device information
@@ -353,18 +377,20 @@ void printOptaSecureInfo(OptaBoardInfo* info) {
   }
 }
 
-void getEthernetMacAddress(OptaBoardInfo* info, char* macAddressBuffer) {
-  // Format MAC address into a char[] buffer using sprintf
-  sprintf(macAddressBuffer, "%02X:%02X:%02X:%02X:%02X:%02X",
+void getEthernetMacAddress(OptaBoardInfo* info, String& macAddress) {
+  char buffer[18];
+  snprintf(buffer, sizeof(buffer), "%02X:%02X:%02X:%02X:%02X:%02X",
           info->mac_address[0], info->mac_address[1], info->mac_address[2],
           info->mac_address[3], info->mac_address[4], info->mac_address[5]);
+  macAddress = String(buffer);
 }
 
-void getWifiMacAddress(OptaBoardInfo* info, char* macAddressBuffer) {
-  // Format MAC address into a char[] buffer using sprintf
-  sprintf(macAddressBuffer, "%02X:%02X:%02X:%02X:%02X:%02X",
+void getWifiMacAddress(OptaBoardInfo* info, String& macAddress) {
+  char buffer[18];
+  snprintf(buffer, sizeof(buffer), "%02X:%02X:%02X:%02X:%02X:%02X",
           info->mac_address_2[0], info->mac_address_2[1], info->mac_address_2[2],
           info->mac_address_2[3], info->mac_address_2[4], info->mac_address_2[5]);
+  macAddress = String(buffer);
 }
 
 /*================================================================================================
@@ -469,6 +495,18 @@ bool initFlash() {
   return true;
 }
 
+bool loadToken(String& outToken) {
+  char buffer[TOKEN_MAX_LEN] = {0};
+
+  if (!loadToken(buffer, TOKEN_MAX_LEN)) {
+    outToken = "";  // Clear the output on failure
+    return false;
+  }
+
+  outToken = String(buffer);
+  return true;
+}
+
 bool loadToken(char* buffer, size_t maxLen) {
   if (flashPartition.init() != 0) return false;
 
@@ -476,6 +514,10 @@ bool loadToken(char* buffer, size_t maxLen) {
   flashPartition.deinit();
 
   return buffer[0] != '\0' && isPrintable(buffer[0]);
+}
+
+void storeToken(const String& token) {
+  storeToken(token.c_str());
 }
 
 void storeToken(const char* token) {
@@ -486,4 +528,3 @@ void storeToken(const char* token) {
 
   flashPartition.deinit();
 }
-

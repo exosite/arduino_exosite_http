@@ -40,47 +40,95 @@
 //                                      Optional Overrides
 //================================================================================================
 
+// Size of internal data buffer (uncomment to override)
+#define EXO_DATA_BUFFER_SIZE 2048
+
 // Debug logging control (uncomment to enable)
-// #define EXO_DEBUG_LOGGING
+#define EXO_DEBUG_LOGGING
 
 // String literals are stored in flash (PROGMEM) rather than RAM (uncomment to disable)
 // #define NO_FLASH_NET_STRINGS
 
-// Size of internal response parsing buffer (uncomment to override)
-// #define EXO_DATA_BUFFER_SIZE 2048
-
 //================================================================================================
 
+// Internal data buffer, used for:
+//   1. Parsing ALL request responses (headers + body)
+//   2. URL-encoding POST request payloads
+#ifndef EXO_DATA_BUFFER_SIZE
+  #define EXO_DATA_BUFFER_SIZE 1024
+#endif
+
+#if EXO_DATA_BUFFER_SIZE <= 256
+  #warning "EXO_DATA_BUFFER_SIZE may be too small. Minimum: 256. Recommended: ≥1024."
+#elif EXO_DATA_BUFFER_SIZE > 2048
+  #warning "EXO_DATA_BUFFER_SIZE is fairly large. Ensure your target hardware has sufficient RAM."
+#endif
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+//                                  Variadic Templates (C++11)
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+template<typename T>
+void logPrintItem(const T& item) {
+  Serial.print(item);
+}
+
+template<typename T, typename... Rest>
+void logPrintItem(const T& item, const Rest&... rest) {
+  Serial.print(item);
+  logPrintItem(rest...);
+}
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+//                                            Macros
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+// Error log formatting
+#define LOG_ERROR(...) do { \
+  if (Serial) { \
+    Serial.print("ERROR ("); \
+    Serial.print("line:"); \
+    Serial.print(__LINE__); \
+    Serial.print(") "); \
+    logPrintItem(__VA_ARGS__); \
+    Serial.println(); \
+  } \
+} while (0)
+
+// (Optional) Debug logging
 #ifdef EXO_DEBUG_LOGGING
   #define LOG_DEBUG(...) do { \
     if (Serial) { \
-      Serial.print("[Debug] "); \
-      Serial.print("(line:"); \
+      Serial.print("DEBUG ("); \
+      Serial.print("line:"); \
       Serial.print(__LINE__); \
       Serial.print(") "); \
-      Serial.println(__VA_ARGS__); \
+      logPrintItem(__VA_ARGS__); \
+      Serial.println(); \
     } \
   } while (0)
 #else
   #define LOG_DEBUG(...) do {} while (0)
 #endif
 
-#ifndef EXO_DATA_BUFFER_SIZE
-  #define EXO_DATA_BUFFER_SIZE 1024
-#endif
-
-#if EXO_DATA_BUFFER_SIZE <= 256
-  #warning "EXO_DATA_BUFFER_SIZE is likely too small. Minimum: >= 256. Recommended: >= 1024."
-#elif EXO_DATA_BUFFER_SIZE >= 2048
-  #warning "EXO_DATA_BUFFER_SIZE is fairly large. Ensure your target hardware has sufficient RAM."
-#endif
-
-// Macro for storing string literals in flash (PROGMEM) rather than RAM
-#if !(defined(ESP8266) || defined(NO_FLASH_NET_STRINGS)) // Disabled for ESP, or manually
-  #define G(x) F(x)
-#else
+// (Optional) Store string literals in flash (PROGMEM) rather than RAM
+#if (defined(ESP8266) || defined(NO_FLASH_NET_STRINGS)) // Disabled for ESP, or manually
   #define G(x) x
+#else
+  #define G(x) F(x)
 #endif
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+//                                       Custom Struct(s)
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+/**
+ * @brief Struct representing the result of an API request
+ */
+struct ApiResponse {
+  bool success;             // result of request + post-processing
+  unsigned int statusCode;  // HTTP status code
+};
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
@@ -156,7 +204,7 @@ class ExositeHTTP {
      *
      * @return `true` if successful and a token was received (HTTP 200), `false` otherwise
      */
-    bool provision(const char* identity, char* responseBuffer, size_t bufferSize);
+    ApiResponse provision(const char* identity, char* responseBuffer, size_t bufferSize);
 
     /**
      * @brief Provision the device identity and receive a server-generated authentication token
@@ -166,7 +214,7 @@ class ExositeHTTP {
      *
      * @return `true` if successful and a token was received (HTTP 200), `false` otherwise
      */
-    bool provision(const String& identity, String& responseString);
+    ApiResponse provision(const String& identity, String& responseString);
 
     /**
      * @brief Write the provided value to the specified resource
@@ -176,7 +224,7 @@ class ExositeHTTP {
      *
      * @return `true` if successful (HTTP 204), `false` otherwise
      */
-    bool write(const char* resource, const char* writeChars);
+    ApiResponse write(const char* resource, const char* writeChars);
 
     /**
      * @brief Write the provided value to the specified resource
@@ -186,7 +234,7 @@ class ExositeHTTP {
      *
      * @return `true` if successful (HTTP 204), `false` otherwise
      */
-    bool write(const String& resource, const String& writeString);
+    ApiResponse write(const String& resource, const String& writeString);
 
     /**
      * @brief Read the latest value of the specified resource
@@ -201,7 +249,7 @@ class ExositeHTTP {
      *
      * @return `true` if successful (HTTP 200 or 204), `false` otherwise
      */
-    bool read(const char* resource, char* responseBuffer, size_t bufferSize);
+    ApiResponse read(const char* resource, char* responseBuffer, size_t bufferSize);
 
     /**
      * @brief Read the latest value of the specified resource
@@ -215,10 +263,10 @@ class ExositeHTTP {
      *
      * @return `true` if successful (HTTP 200 or 204), `false` otherwise
      */
-    bool read(const String& resource, String& responseString);
+    ApiResponse read(const String& resource, String& responseString);
 
     /**
-     * @brief Check/wait for a new value on the specified resource
+     * @brief Blocking check/wait for a new value on the specified resource
      *
      * Note:
      *
@@ -232,10 +280,11 @@ class ExositeHTTP {
      *
      * @return `true` if new data or pollTimeout reached (HTTP 200 or 304), `false` otherwise
      */
-    bool longPoll(const char* resource, char* responseBuffer, size_t bufferSize, unsigned long lastModified = 0, unsigned long pollTimeout = 5000);
+    ApiResponse longPoll(const char* resource, char* responseBuffer, size_t bufferSize,
+                         unsigned long lastModified=0, unsigned long pollTimeout=5000);
 
     /**
-     * @brief Check/wait for a new value on the specified resource
+     * @brief Blocking check/wait for a new value on the specified resource
      *
      * Note:
      *
@@ -248,7 +297,8 @@ class ExositeHTTP {
      *
      * @return `true` if new data or pollTimeout reached (HTTP 200 or 304), `false` otherwise
      */
-    bool longPoll(const String& resource, String& responseString, unsigned long lastModified = 0, unsigned long pollTimeout = 5000);
+    ApiResponse longPoll(const String& resource, String& responseString,
+                         unsigned long lastModified=0, unsigned long pollTimeout=5000);
 
     /**
      * @brief Retrieve the current time from the server
@@ -259,7 +309,7 @@ class ExositeHTTP {
      *
      * @return Current time from the server (epoch seconds), or `0` if the request fails
      */
-    unsigned long timestamp();
+    ApiResponse timestamp(unsigned long* serverTime);
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
@@ -271,28 +321,119 @@ class ExositeHTTP {
     char _connector[128];
     char _clientToken[41];
 
-    unsigned long _rxTimeout = 10000; // Request response timeout (ms) (see: `setTimeout()`)
+    unsigned long _rxTimeout = 10000; // Timeout (ms) for request response (see: `setTimeout()`)
 
     char _dataBuffer[EXO_DATA_BUFFER_SIZE]; // Internal buffer for cloud request/response handling
 
     char _pollHeaders[64]; // Internal buffer for building Long Poll headers
 
+    unsigned int _flushDelay = 10; // Delay (ms) between availability checks when flushing socket data
+    unsigned int _flushTimeout = 200; // Timeout (ms) between bytes when flushing socket data
+
+    /**
+     * @brief Sets the domain (host) the internal `_client` will use for subsequent HTTP requests
+     *
+     * @param domain Domain name of the IoT Connector (e.g. "a5b9czkndm4g00000.m2.exosite.io")
+     */
     void setDomain(const char* domain);
 
+    /**
+     * @brief Flushes the client connection buffer, clearing any incoming/outgoing data
+     */
+    void flushClient();
+
+    /**
+     * @brief Checks if the client is connected to the server
+     * 
+     * Note: If not, returns the result of an attempt to connect
+     *
+     * @return `true` if connected, `false` otherwise
+     */
     bool isConnected();
 
+    /**
+     * @brief Determines whether the specified time interval has passed
+     *
+     * @param start     Start time (ms) (e.g. from `millis()`)
+     * @param duration  Duration (ms) to check against
+     *
+     * @return `true` if the time has expired, `false` otherwise
+     */
     bool timeExpired(unsigned long start, unsigned long duration);
 
+    /**
+     * @brief Reads the full HTTP response from the server into a buffer
+     *
+     * @param destBuffer  Buffer in which to store the full HTTP response
+     * @param bufferSize  Size of the destination buffer
+     * @param timeoutMs   Timeout (ms) for awaiting/reading-in the response
+     *
+     * @return `true` if the response was read successfully, `false` on timeout or error
+     */
     bool readHttpResponse(char* destBuffer, size_t bufferSize, unsigned long timeoutMs);
 
-    void sendGetRequest(const char* path, const char* resource = nullptr, const char* authToken = nullptr, const char* extraHeaders = nullptr);
-    void sendPostRequest(const char* path, const char* key, const char* value, const char* authToken = nullptr);
+    /**
+     * @brief Sends an HTTP GET request to the specified path
+     *
+     * @param path          API endpoint
+     * @param resource      (Optional) Resource alias to be queried
+     * @param authToken     (Optional) Client auth token
+     * @param extraHeaders  (Optional) Additional headers to be included (e.g. for `longPoll()`)
+     */
+    void sendGetRequest(const char* path,
+                        const char* resource=nullptr, const char* authToken=nullptr, const char* extraHeaders=nullptr);
 
+    /**
+     * @brief Sends an HTTP POST request to the specified path, with a single key/value pair in the body
+     *
+     * @param path       API endpoint
+     * @param key        Key to send in the POST body
+     * @param value      Value to associate with the key in the POST body
+     * @param authToken  (Optional) Client auth token
+     */
+    void sendPostRequest(const char* path, const char* key, const char* value,
+                         const char* authToken=nullptr);
+
+    /**
+     * @brief Constructs HTTP headers for a Long Poll request (`Last-Modified` and `Request-Timeout`)
+     *
+     * @param buffer         Buffer in which to store the headers
+     * @param bufferSize     Size of the destination buffer
+     * @param lastModified   Timestamp (ms) for the `Last-Modified` header
+     * @param pollTimeoutMs  Timeout (ms) for the `Request-Timeout` header
+     */
     void buildPollHeaders(char* buffer, size_t bufferSize, unsigned long lastModified, unsigned long pollTimeoutMs);
 
-    void urlEncode(const char* src, char* dest, size_t destSize);
-    void urlEncode(const String& src, String& dest);
+    /**
+     * @brief URL-encodes a value into the destination buffer
+     *
+     * @param src       Source value to be encoded
+     * @param dest      Buffer in which to store the encoded value
+     * @param destSize  Size of the destination buffer
+     *
+     * @return `true` if encoding was successful, `false` on error or (e.g. insufficient buffer)
+     */
+    bool urlEncode(const char* src, char* dest, size_t destSize);
 
-    void urlDecode(const char* src, char* dest);
-    void urlDecode(const String& input, String& responseString);
+    /**
+     * @brief URL-decodes an encoded value into a buffer
+     *
+     * @param src       Source value to be decoded
+     * @param dest      Buffer in which to store the decoded value
+     * @param destSize  Size of the destination buffer
+     *
+     * @return `true` if the decoding was successful, `false` on error or (e.g. insufficient buffer)
+     */
+    bool urlDecode(const char* src, char* dest, size_t destSize);
+
+    /**
+     * @brief URL-decodes an encoded value into a buffer
+     *
+     * @param src       Source value to be decoded
+     * @param dest      Buffer in which to store the decoded value
+     * @param destSize  Size of the destination buffer
+     *
+     * @return `true` if the decoding was successful, `false` on error or (e.g. insufficient buffer)
+     */
+    bool urlDecode(const String& input, String& responseString);
 };
