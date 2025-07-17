@@ -41,10 +41,10 @@
 //================================================================================================
 
 // Size of internal data buffer (uncomment to override)
-#define EXO_DATA_BUFFER_SIZE 2048
+// #define EXO_DATA_BUFFER_SIZE 2048
 
 // Debug logging control (uncomment to enable)
-#define EXO_DEBUG_LOGGING
+// #define EXO_DEBUG_LOGGING
 
 // String literals are stored in flash (PROGMEM) rather than RAM (uncomment to disable)
 // #define NO_FLASH_NET_STRINGS
