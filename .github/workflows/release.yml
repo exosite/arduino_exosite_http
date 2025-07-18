@@ -1,0 +1,39 @@
+name: Conditional Release
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2  # So we have access to previous commit for diffing
+
+      - name: Check if version changed
+        id: check_version
+        run: |
+          VERSION=$(grep ^version library.properties | cut -d= -f2)
+          echo "Library version: $VERSION"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+          if git diff HEAD^ HEAD -- library.properties | grep '^+version='; then
+            echo "version_changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "No version change. Skipping release."
+            echo "version_changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub Release
+        if: steps.check_version.outputs.version_changed == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.check_version.outputs.version }}
+          name: Release v${{ steps.check_version.outputs.version }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
